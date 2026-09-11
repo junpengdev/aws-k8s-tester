@@ -1,0 +1,71 @@
+# Oversubscription workload shared by the GPU-sharing features (time-slicing and
+# MPS). Rendered once per feature with its own {{.Name}}, so each gets its own Job
+# and label selector.
+#
+# completions == parallelism == {{.Completions}}, the node's full shared allocatable
+# count, and every pod requests one nvidia.com/gpu.
+#
+# Checking allocatable alone only proves the device plugin can multiply a number,
+# and Job completion alone proves nothing either: with one physical GPU and no
+# sharing this Job still succeeds, because each pod releases the GPU when it exits
+# and the next is then admitted. So each pod reports the UUID of the GPU it opened
+# and holds the device busy for a fixed window, which lets the test observe the pods
+# running at the same time on the same physical GPU. That pair is what distinguishes
+# real sharing from Kubernetes queueing the pods.
+kind: Job
+apiVersion: batch/v1
+metadata:
+  name: {{.Name}}
+  labels:
+    app: {{.Name}}
+spec:
+  completions: {{.Completions}}
+  parallelism: {{.Completions}}
+  # A pod that cannot get a shared GPU should fail the feature, not retry until an
+  # unrelated slot frees up and mask the problem.
+  backoffLimit: 0
+  activeDeadlineSeconds: {{.ActiveDeadlineSeconds}}
+  template:
+    metadata:
+      labels:
+        app: {{.Name}}
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: cuda-workload
+        image: {{.NvidiaTestImage}}
+        imagePullPolicy: Always
+        # vectorAdd is built into the image and verifies its own result, so a pod
+        # that is scheduled but cannot actually reach the GPU fails rather than
+        # exiting zero.
+        command:
+        - bash
+        - -c
+        - |
+          set -o pipefail
+          # Parsed by the test to confirm every pod opened the same physical GPU.
+          # Checked here rather than only printed: echo of a failed substitution
+          # still exits 0, so an unreadable value would emit an empty marker and the
+          # test would see agreement between pods that read nothing.
+          gpu_uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader | head -1)
+          if [ -z "$gpu_uuid" ]; then
+            echo "failed to read the GPU UUID from nvidia-smi" >&2
+            exit 1
+          fi
+          echo "GPU_UUID=$gpu_uuid"
+          echo "pod $HOSTNAME starting on $(nvidia-smi --query-gpu=index,name --format=csv,noheader | tr '\n' ';')"
+          vectorAdd
+          # A single vectorAdd is milliseconds of GPU work, far too short for the
+          # test to ever catch two pods running together. Keep re-running it for a
+          # fixed window so the overlap is observable and the GPU is under genuine
+          # contention from all the pods at once.
+          end=$(( SECONDS + {{.HoldSeconds}} ))
+          while [ "$SECONDS" -lt "$end" ]; do
+            vectorAdd > /dev/null || exit 1
+          done
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            cpu: "1"
+            memory: 1Gi
