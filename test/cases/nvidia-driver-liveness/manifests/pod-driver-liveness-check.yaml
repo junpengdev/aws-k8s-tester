@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nvidia-driver-liveness-check
+spec:
+  restartPolicy: Never
+  tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Exists"
+    effect: "NoSchedule"
+  containers:
+  - name: driver-liveness-check
+    image: {{.NvidiaTestImage}}
+    env:
+    - name: NVIDIA_DRIVER_CAPABILITIES
+      value: "compute,utility"
+    - name: EXPECTED_DRIVER_VERSION
+      value: "{{.ExpectedDriverVersion}}"
+    - name: EXPECTED_GPU_NAME
+      value: "{{.ExpectedGPUName}}"
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -eu
+      set -o pipefail
+
+      # ------------------------------------------------------------------
+      # 1.1  test_nvidia_smi_runs -- cheapest liveness probe.
+      # `nvidia-smi -L` exits 0 iff NVML initialised, kernel module
+      # answered, and the management path is intact. The classic
+      # "Driver/library version mismatch" failure after a bad re-point
+      # exits non-zero here.
+      # ------------------------------------------------------------------
+      echo "=== 1.1 nvidia-smi -L ==="
+      if ! nvidia-smi -L; then
+        echo "FAIL 1.1: nvidia-smi -L returned non-zero. NVML failed to"
+        echo "  initialise -- most likely a driver/library version mismatch"
+        echo "  after a botched re-point on a multi-driver AMI."
+        exit 10
+      fi
+
+      # ------------------------------------------------------------------
+      # 1.5  test_nvidia_driver_version -- exact version assertion.
+      # On a multi-driver AMI the dangerous failure is not "no driver"
+      # but "the wrong driver". Assert every GPU reports the version
+      # this AMI was built to ship. Skip if EXPECTED_DRIVER_VERSION is
+      # unset (additive behaviour).
+      # ------------------------------------------------------------------
+      echo "=== 1.5 driver version = expected ==="
+      if [ -z "$EXPECTED_DRIVER_VERSION" ]; then
+        echo "SKIP 1.5: EXPECTED_DRIVER_VERSION not set"
+      else
+        # Capture nvidia-smi output first 
+        driver_versions=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader) || {
+          echo "FAIL 1.5: nvidia-smi driver_version query failed"
+          exit 11
+        }
+        if [ -z "$driver_versions" ]; then
+          echo "FAIL 1.5: nvidia-smi reported no GPUs"
+          exit 11
+        fi
+        while read -r actual; do
+          if [ "$actual" != "$EXPECTED_DRIVER_VERSION" ]; then
+            echo "FAIL 1.5: driver version '$actual' != expected '$EXPECTED_DRIVER_VERSION'"
+            exit 11
+          fi
+        done <<< "$driver_versions"
+        echo "OK 1.5: every GPU reports driver version $EXPECTED_DRIVER_VERSION"
+      fi
+
+      # ------------------------------------------------------------------
+      # 1.8  test_nvidia_gpu_model -- GPU model reported by the driver
+      # must match what AWS advertises for this instance type. The
+      # expected string comes from ec2:DescribeInstanceTypes' GpuInfo
+      # (looked up by the Go test and threaded in as EXPECTED_GPU_NAME).
+      # EC2's short name (e.g. "A100", "H100", "L4", "T4") is a
+      # case-insensitive substring of nvidia-smi's product name
+      # (e.g. "NVIDIA A100-SXM4-40GB"), so we substring-match instead
+      # of maintaining a per-family regex table.
+      # ------------------------------------------------------------------
+      echo "=== 1.8 GPU model matches instance type ==="
+      if [ -z "$EXPECTED_GPU_NAME" ]; then
+        echo "SKIP 1.8: EXPECTED_GPU_NAME not set (ec2:DescribeInstanceTypes lookup skipped)"
+      else
+        gpu_names=$(nvidia-smi --query-gpu=name --format=csv,noheader) || {
+          echo "FAIL 1.8: nvidia-smi name query failed"
+          exit 12
+        }
+        if [ -z "$gpu_names" ]; then
+          echo "FAIL 1.8: nvidia-smi reported no GPUs"
+          exit 12
+        fi
+        while read -r name; do
+          if ! echo "$name" | grep -qiF "$EXPECTED_GPU_NAME"; then
+            echo "FAIL 1.8: GPU model '$name' does not contain expected substring '$EXPECTED_GPU_NAME'"
+            exit 12
+          fi
+        done <<< "$gpu_names"
+        echo "OK 1.8: every GPU model contains '$EXPECTED_GPU_NAME'"
+      fi
+
+      echo "=== all driver-liveness checks passed ==="
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+      limits:
+        nvidia.com/gpu: "1"
